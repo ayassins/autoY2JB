@@ -215,19 +215,42 @@ async function elf_loader() {
     }
 }
 
-async function bin_sender(payload_buf, payload_len) {
-    const TARGET_IP   = 0x0100007Fn;             
+async function bin_sender(path) {           
     const TARGET_PORT = 9021;
-    const CHUNK_SIZE  = 64 * 1024;                
+    const TARGET_IP   = 0x0100007Fn;
+    const PAYLOAD_MAX = 5 * 1024 * 1024; //5 MB
 
-    function htons(v) {
-        return ((v & 0xFFn) << 8n) | ((v >> 8n) & 0xFFn);
+    // resolve ip
+    let target_ip = 0x0100007Fn; 
+    let ip_str = "127.0.0.1";
+    const lan_ip = get_current_ip();
+    if (lan_ip && lan_ip !== "0.0.0.0" && lan_ip !== "127.0.0.1") {
+        // target_ip = ip_to_uint32(lan_ip);
+        ip_str = lan_ip;
+    }
+
+    await log("[+] Sending to " + ip_str + ":" + TARGET_PORT);
+
+    // ---- open file ------------------------------------------------
+    const src_addr = alloc_string(path);
+    const src_fd = syscall(SYSCALL.open, src_addr, O_RDONLY);
+    if (src_fd === 0xffffffffffffffffn) {
+        await log("[-] Cannot open source: " + path);
+        return false;
+    }
+    const stat = malloc(0x100);
+    syscall(SYSCALL.fstat, src_fd, stat);
+    const file_size = read64(stat + 0x48n);
+    if (file_size === 0n || file_size > BigInt(PAYLOAD_MAX)) {
+        syscall(SYSCALL.close, src_fd);
+        await log("[-] Invalid file size");
+        return false;
     }
 
     // ---- socket ------------------------------------------------
     const sock = syscall(SYSCALL.socket, AF_INET, SOCK_STREAM, 0n);
     if (sock === 0xffffffffffffffffn) {
-        await log("ERROR: socket() failed");
+        await log("[-] socket() failed");
         return false;
     }
 
@@ -239,74 +262,97 @@ async function bin_sender(payload_buf, payload_len) {
     write32(addr + 4n, TARGET_IP);
 
     // ---- connect -----------------------------------------------
-    const c = syscall(SYSCALL.connect, sock, addr, 16n);                                      // no longer needed
+    const c = syscall(SYSCALL.connect, sock, addr, 16n);                                      
     if (c === 0xffffffffffffffffn) {
         syscall(SYSCALL.close, sock);
-        await log("ERROR: connect() failed");
+        await log("[-] connect() failed");
         return false;
     }
-    await log("Connected!");
+    await log("[+] Connected to target!");
 
-    // ---- chunked send -----------------------------------------
+    // ---- read & send -----------------------------------------------
+    const buf = malloc(256 * 1024); //256 KB
+    let total = 0n;
     let offset = 0n;
-    while (offset < BigInt(payload_len)) {
-        const remaining = BigInt(payload_len) - offset;
-        const chunk     = remaining < BigInt(CHUNK_SIZE) ? remaining : BigInt(CHUNK_SIZE);
 
-        const sent = syscall(SYSCALL.write, sock, payload_buf + offset, chunk);
-        if (sent <= 0n) {
-            syscall(SYSCALL.close, sock);
-            await log("ERROR: " + sent);
-            return false;
+    while (offset < file_size) {
+        const to_read = file_size - offset > 256n * 1024n ? 256n * 1024n : file_size - offset;
+        const read = syscall(SYSCALL.read, src_fd, buf, to_read);
+        if (read <= 0n) break;
+
+        let written = 0n;
+        while (written < read) {
+            const w = syscall(SYSCALL.write, sock, buf + written, read - written);
+            if (w <= 0n) {
+                syscall(SYSCALL.close, sock);
+                syscall(SYSCALL.close, src_fd);
+                await log("[-] write failed");
+                return false;
+            }
+            written += w;
         }
-        offset += sent;
+        offset += read;
+        total += read;
+
+        const pct = Math.floor(Number(total * 100n / file_size));
+        if (pct > 0 && pct % 25 === 0) await log("Progress: " + pct + "%");
     }
 
     syscall(SYSCALL.close, sock);
-    await log("Sent " + payload_len + " bytes successfully");
+    syscall(SYSCALL.close, src_fd);
+
+    if (total !== file_size) {
+        await log("[-] incomplete send: " + total + "/" + file_size);
+        return false;
+    }
+    await log("[+] Sent " + payload_len + " bytes successfully");
+
     return true;
 }
 
 async function autoload() {
     const INTERNAL          = "/data/payload.bin";
     const PAYLOAD_NAME      = "payload.bin";
-    const PAYLOAD_MAX       = 5 * 1024 * 1024;
     const payload_download0_path = "/mnt/sandbox/" + get_title_id() +
                                    "_000/download0/cache/splash_screen/" +
                                    "aHR0cHM6Ly93d3cueW91dHViZS5jb20vdHY=/payload.bin";
 
     // usb check                            
-    const usb_paths = [];
-    for (let i = 0; i <= 7; i++) usb_paths.push(`/mnt/usb${i}/${PAYLOAD_NAME}`);
     let usb_path = null;
-    for (const p of usb_paths) if (file_exists(p)) { usb_path = p; break; }
+    for (let i = 0; i <= 7; i++) {
+        const p = `/mnt/usb${i}/${PAYLOAD_NAME}`;
+        if (file_exists(p)) { usb_path = p; break; }
+    }
     // either usb and internal not exist
     if (!usb_path && !file_exists(INTERNAL)) {
-        await log("[-] payload not found in usb & internal storage!");
-        send_notification("payload not found, executing default payload at download0");
-        // check at download0
+        await log("[-] No payload in USB or internal");
+        send_notification("Using fallback payload");
+
         if (!file_exists(payload_download0_path)) {
-            await log("[-] fallback payload missing!");
-            send_notification("fallback payload missing!");
+            await log("[-] Fallback missing!");
+            send_notification("Fallback payload missing!");
             return;
         }
-        // copy to internal
-        const ok = await copy_binary_file(payload_download0_path, INTERNAL);
-        if (!ok) return;                
+        // copy from download0 to internal
+        if (!(await copy_binary_file(payload_download0_path, INTERNAL))) return;
+        send_notification("Payload copied from download0!");
     }
     else if (usb_path) {
         // copy new payload from usb
-        const ok = await copy_binary_file(usb_path, INTERNAL);
-        if (!ok) return;
+        if (!(await copy_binary_file(usb_path, INTERNAL))) return;
+        send_notification("Payload copied from USB!");
     } else {
-        await log("using internal payload: " + INTERNAL);
+        await log("[=] using internal payload: " + INTERNAL);
     }
     // sent payload
-    const ab = await read_file(INTERNAL);
-    const len = ab.byteLength;
-    if (len === 0 || len > PAYLOAD_MAX) throw new Error("size check failed");
-
-    const ptr = arrayBufferToBigInt(ab);
-    const ok = await bin_sender(ptr, len);        
-    if (ok) send_notification("Payload loaded!\nClosing Y2JB...");
+    sleep(500);
+    try {
+        const ok = await bin_sender(INTERNAL);
+        if (ok) {
+            send_notification("Payload loaded!\nClosing Y2JB...");
+            await log("Payload loaded!\nClosing Y2JB...");
+        }
+    } catch (e) {
+        await log("ERROR: " + e.message);
+    }
 }

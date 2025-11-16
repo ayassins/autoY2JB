@@ -445,51 +445,53 @@ function write_file(path, text) {
     return Number(written); // number of bytes written
 }
 
-function arrayBufferToBigInt(ab) {
-    const ptr = malloc(ab.byteLength);
-    const view = new Uint8Array(ab);
-    for (let i = 0; i < view.length; i++) {
-        write8(ptr + BigInt(i), BigInt(view[i]));
-    }
-    return ptr;
+function ip_to_uint32(ip) {
+    const p = ip.split('.').map(Number);
+    if (p.length !== 4) return null;
+    return (BigInt(p[0]) << 24n) | (BigInt(p[1]) << 16n) | (BigInt(p[2]) << 8n) | BigInt(p[3]);
 }
 
-async function safe_read_file(path) {
-    try { return new Uint8Array(await read_file(path)); }
-    catch { return null; }
-}
+function htons(v) { return ((v & 0xFFn) << 8n) | ((v >> 8n) & 0xFFn); }
 
 async function copy_binary_file(src_path, dst_path) {
-    let src_ptr = 0n;
-    let file_size = 0;
-
-    try {
-        const ab = await read_file(src_path);      
-        file_size = ab.byteLength;
-        src_ptr   = arrayBufferToBigInt(ab);
-    } catch (e) {
-        await log("Error: " + e.message);
-        return false;
-    }
-
-    const mode = 0x1ffn;                              
+    const src_addr = alloc_string(src_path);
     const dst_addr = alloc_string(dst_path);
-    const flags = O_CREAT | O_WRONLY | O_TRUNC;
-    const fd = syscall(SYSCALL.open, dst_addr, flags, mode);
-    if (fd === 0xffffffffffffffffn) {
-        await log("Failed to open destination: " + dst_path);
-        return false;
-    }
-    const written = syscall(SYSCALL.write, fd, src_ptr, BigInt(file_size));
-    syscall(SYSCALL.close, fd);
 
-    if (written !== BigInt(file_size)) {
-        await log("Write incomplete");
+    const src_fd = syscall(SYSCALL.open, src_addr, O_RDONLY);
+    if (src_fd === 0xffffffffffffffffn) {
+        await log("[-] Source not found: " + src_path);
         return false;
     }
 
-    await log("Copied " + file_size + " bytes");
-    send_notification("Payload copied from USB!");
+    const stat = malloc(0x100);
+    syscall(SYSCALL.fstat, src_fd, stat);
+    const size = read64(stat + 0x48n);
+
+    const dst_fd = syscall(SYSCALL.open, dst_addr, O_CREAT | O_WRONLY | O_TRUNC, 0x1ffn);
+    if (dst_fd === 0xffffffffffffffffn) {
+        syscall(SYSCALL.close, src_fd);
+        await log("[-] Cannot create: " + dst_path);
+        return false;
+    }
+
+    const buf = malloc(256 * 1024);  // 256 KB temp buffer
+    let total = 0n;
+    while (total < size) {
+        const to_read = size - total > 256n * 1024n ? 256n * 1024n : size - total;
+        const read = syscall(SYSCALL.read, src_fd, buf, to_read);
+        if (read <= 0n) break;
+        const wrote = syscall(SYSCALL.write, dst_fd, buf, read);
+        if (wrote !== read) break;
+        total += read;
+    }
+    syscall(SYSCALL.close, src_fd);
+    syscall(SYSCALL.close, dst_fd);
+
+    if (total !== size) {
+        await log("[-] Copy failed: " + total + "/" + size);
+        return false;
+    }
+    await log("[+] Copied " + size + " bytes");
     return true;
 }
 
@@ -514,6 +516,9 @@ function nanosleep(nsec) {
     syscall(SYSCALL.nanosleep, timespec);
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 function get_dlsym_offset(fw_version) {
     const [major, minor] = fw_version.split(".").map(Number);
