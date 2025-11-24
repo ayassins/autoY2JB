@@ -345,7 +345,7 @@ async function autoload() {
         await log("[=] using internal payload: " + INTERNAL);
     }
     // sent payload
-    sleep(500);
+    await sleep(500);
     try {
         const ok = await bin_sender(INTERNAL);
         if (ok) {

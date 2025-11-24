@@ -6,7 +6,7 @@
 */
 
 const version_string = "Y2JB 1.2.1 by Gezine";
-const auto_version_string = "autoY2JB v0.2";
+const auto_version_string = "autoY2JB v0.3";
 
 function load_localscript(src) {
     return new Promise((resolve, reject) => {
@@ -909,7 +909,7 @@ function trigger() {
         ////////////////////
         
         send_notification(auto_version_string);
-        sleep(2000);
+        await sleep(2000);
 
         //await load_localscript('remotejsloader.js');
         await load_localscript('lapse.js');
